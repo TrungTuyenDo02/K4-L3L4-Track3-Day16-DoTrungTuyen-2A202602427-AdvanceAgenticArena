@@ -71,6 +71,9 @@ DEFAULT_MAX_ATTEMPTS = 3
 #: Số lượt để dành cho `submit` mà agent vẫn còn phải gọi.
 DEFAULT_RESERVE = 1
 
+#: Error texts from `arena/tools.py` that are deterministic, not flaky.
+PERMANENT_ERRORS = ("doc not found:", "invalid expression:", "unknown tool:", "budget exhausted:")
+
 
 class Retry(Middleware):
     """Gọi lại một lượt công cụ trả về kết quả hỏng hoặc suy giảm."""
@@ -85,17 +88,39 @@ class Retry(Middleware):
         self.max_attempts = max(1, int(max_attempts))
         self.reserve = max(0, int(reserve))
 
+    def _spent(self, ctx) -> bool:
+        limit = ctx.max_tool_calls
+        return limit is not None and ctx.tools.calls >= limit - self.reserve
+
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§7): khoảng 8-12 dòng.
-        #  1. Trong khi số lần đã thử < self.max_attempts VÀ kết quả còn
-        #     hỏng — tức `(not result.ok) or is_degraded(result.content)` —
-        #     thì gọi lại `call(name, args)` với ĐÚNG name/args cũ.
-        #  2. DỪNG THỬ LẠI khi ngân sách đã cạn: nếu
-        #     `ctx.max_tool_calls` khác None và
-        #     `ctx.tools.calls >= ctx.max_tool_calls - self.reserve`
-        #     thì đừng gọi thêm lượt nào nữa (xem phần cảnh báo ở trên).
-        #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
-        #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
-        #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        attempts = 1
+        while (
+            attempts < self.max_attempts
+            and _is_bad(result)
+            and not _is_permanent(result)
+            and not self._spent(ctx)
+        ):
+            result = call(name, args)
+            attempts += 1
+        if attempts > 1:
+            ctx.state["retry.extra_attempts"] = (
+                ctx.state.get("retry.extra_attempts", 0) + attempts - 1
+            )
+        if _is_bad(result):
+            ctx.state["retry.still_degraded"] = ctx.state.get("retry.still_degraded", 0) + 1
+        return result
+
+
+def _is_bad(result) -> bool:
+    if result is None or not hasattr(result, "ok"):
+        return False
+    content = result.content if isinstance(result.content, str) else ""
+    return (not result.ok) or is_degraded(content)
+
+
+def _is_permanent(result) -> bool:
+    """Failures a second identical call cannot fix: retrying them only
+    burns budget (a missing doc id, a malformed expression, a bad tool)."""
+    error = result.error if isinstance(getattr(result, "error", None), str) else ""
+    return any(marker in error for marker in PERMANENT_ERRORS)

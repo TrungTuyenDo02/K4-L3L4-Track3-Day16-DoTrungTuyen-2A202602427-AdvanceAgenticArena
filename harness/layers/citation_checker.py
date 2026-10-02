@@ -59,6 +59,14 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._evidence import (
+    MAX_CLAIMS_PER_DOC,
+    doc_lines,
+    norm,
+    retrieved_doc_ids,
+    supporting_doc_ids,
+    supports,
+)
 from harness.middleware import Middleware
 
 
@@ -68,16 +76,48 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return {}
+        claims = report.get("claims")
+        if ctx.corpus is None or not isinstance(claims, list) or not claims:
+            return report
+
+        lines = doc_lines(ctx.corpus)
+        retrieved = retrieved_doc_ids(ctx)
+        per_doc: dict = {}
+        fixed = []
+        moved = 0
+        for claim in claims:
+            if isinstance(claim, str):
+                claim = {"text": claim, "doc_id": ""}  # same words, now citable
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                fixed.append(claim)
+                continue
+            text = norm(claim["text"])
+            doc_id = claim.get("doc_id")
+            doc_id = doc_id.strip() if isinstance(doc_id, str) else ""
+            correct = doc_id in retrieved and supports(lines.get(doc_id, ()), text)
+            if not correct:
+                # Only documents the run retrieved (else UNRETRIEVED), best
+                # source first; spread claims so no doc passes the per-doc cap.
+                sources = supporting_doc_ids(ctx, text, retrieved, lines)
+                roomy = [d for d in sources if per_doc.get(d, 0) < MAX_CLAIMS_PER_DOC]
+                source = (roomy or sources or [None])[0]
+                if source is not None:
+                    claim = {**claim, "doc_id": source}  # text untouched
+                    doc_id = source
+                    moved += 1
+            if doc_id:
+                per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+            fixed.append(claim)
+
+        ctx.state["citation_checker.reattributed"] = moved
+        report["claims"] = fixed
+        report["citations"] = sorted(
+            {
+                c["doc_id"]
+                for c in fixed
+                if isinstance(c, dict) and isinstance(c.get("doc_id"), str) and c["doc_id"]
+            }
+        )
+        return report

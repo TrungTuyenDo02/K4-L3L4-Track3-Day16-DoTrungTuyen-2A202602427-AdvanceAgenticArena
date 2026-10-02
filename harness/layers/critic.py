@@ -70,7 +70,42 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._evidence import (
+    MAX_CLAIM_CHARS,
+    MAX_CLAIMS_PER_DOC,
+    MAX_SCORED_CLAIMS,
+    doc_lines,
+    norm,
+    retrieved_doc_ids,
+    supported_segments,
+    supporting_doc_ids,
+)
 from harness.middleware import Middleware
+
+#: Prepended to `answer` when nothing citable survives. Deliberately avoids
+#: wording a synthesis brief might use as a verdict phrase.
+NO_EVIDENCE_NOTE = (
+    "Không tìm thấy bằng chứng trích dẫn được trong tài liệu đã đọc để trả lời "
+    "chắc chắn câu hỏi này."
+)
+
+#: The glue a fused sentence is spliced with (case (c) in the docstring).
+SPLICE_JOINS = ("và", "nhưng", "trong khi", "còn", "tuy nhiên")
+
+#: A trimmed segment must keep this much of the claim to be worth citing.
+MIN_SEGMENT_CHARS = 24
+MIN_SEGMENT_SHARE = 0.3
+MIN_KEPT_SHARE = 0.45
+MAX_SEGMENTS = 3
+
+
+def _has_digit(text: str) -> bool:
+    return any(ch.isdigit() for ch in text)
+
+
+def _gap_is_join(gap: str) -> bool:
+    gap = norm(gap).strip(" ,;:-–—")
+    return gap in SPLICE_JOINS
 
 
 class Critic(Middleware):
@@ -78,17 +113,133 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def _segments(self, text, haystack):
+        """Trim/split a claim no single line supports into the largest
+        substrings that ARE quotations. Returns raw substrings (in order)
+        and whether the cut points look like a splice."""
+        total = len(norm(text))
+        spans = supported_segments(text, haystack)
+        spans.sort(key=lambda s: (-len(norm(text[s[0]:s[1]])), s[0]))
+        floor = max(MIN_SEGMENT_CHARS, MIN_SEGMENT_SHARE * total)
+        chosen = []
+        for start, end in spans:
+            if len(norm(text[start:end])) < floor:
+                continue
+            if any(start < e and s < end for s, e in chosen):
+                continue
+            chosen.append((start, end))
+            if len(chosen) >= MAX_SEGMENTS:
+                break
+        chosen.sort()
+        kept = sum(len(norm(text[s:e])) for s, e in chosen)
+        if not chosen or kept < MIN_KEPT_SHARE * total:
+            return [], False
+        if _has_digit(text) and not any(_has_digit(text[s:e]) for s, e in chosen):
+            return [], False
+        joined = len(chosen) >= 2 and all(
+            _gap_is_join(text[chosen[i][1]:chosen[i + 1][0]]) for i in range(len(chosen) - 1)
+        )
+        return [text[s:e] for s, e in chosen], joined
+
+    def _judge_with_corpus(self, ctx, claims):
+        lines = doc_lines(ctx.corpus)
+        retrieved = retrieved_doc_ids(ctx)
+        haystack = "\n".join(
+            line for doc_id in sorted(retrieved) for line in lines.get(doc_id, ())
+        )
+        kept, spliced, dropped, trimmed = [], False, 0, 0
+        for claim in claims:
+            text = claim["text"]
+            doc_id = claim.get("doc_id")
+            doc_id = doc_id if isinstance(doc_id, str) else ""
+            normalised = norm(text)
+            if len(normalised) <= MAX_CLAIM_CHARS and supporting_doc_ids(
+                ctx, normalised, retrieved, lines
+            ):
+                # In the evidence. A wrong doc_id is citation_checker's job.
+                kept.append(claim)
+                continue
+            pieces, joined = self._segments(text, haystack)
+            sources = []
+            for piece in pieces:
+                found = supporting_doc_ids(ctx, norm(piece), retrieved, lines)
+                if len(norm(piece)) > MAX_CLAIM_CHARS or not found:
+                    sources = []
+                    break
+                sources.append(doc_id if doc_id in found else found[0])
+            if not sources:
+                dropped += 1  # fabricated or paraphrased: no line says it
+                continue
+            for piece, source in zip(pieces, sources):
+                kept.append({**claim, "text": piece, "doc_id": source})  # a substring
+            trimmed += 1
+            if joined and len(set(sources)) >= 2:
+                spliced = True  # two sources fused into one sentence
+        ctx.state["critic.dropped"] = dropped
+        ctx.state["critic.trimmed"] = trimmed
+        return kept, spliced
+
+    def _judge_without_corpus(self, ctx, claims):
+        kept, spliced = [], False
+        for claim in claims:
+            text = claim["text"]
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+            for join in SPLICE_JOINS:
+                head, sep, tail = text.partition(f" {join} ")
+                if sep and ctx.saw(head) and ctx.saw(tail):
+                    kept.append({**claim, "text": head})
+                    kept.append({**claim, "text": tail})
+                    spliced = True
+                    break
+        return kept, spliced
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            report = {}
+        claims = report.get("claims")
+        claims = claims if isinstance(claims, list) else []
+        claims = [{"text": c, "doc_id": ""} if isinstance(c, str) else c for c in claims]
+        claims = [
+            c for c in claims if isinstance(c, dict) and isinstance(c.get("text"), str)
+        ]
+        if ctx.corpus is not None:
+            kept, spliced = self._judge_with_corpus(ctx, claims)
+        else:
+            kept, spliced = self._judge_without_corpus(ctx, claims)
+
+        # Shape caps the scorer prices as pure penalty: duplicates, more
+        # than MAX_CLAIMS_PER_DOC on one doc, more than MAX_SCORED_CLAIMS.
+        # A duplicate is the same TEXT whatever it cites: near-identical
+        # template documents share lines, and the second copy can only
+        # eat the irrelevance allowance, never add recall.
+        final, seen, per_doc = [], set(), {}
+        for claim in kept:
+            doc_id = claim.get("doc_id") if isinstance(claim.get("doc_id"), str) else ""
+            key = norm(claim["text"])
+            if key in seen:
+                continue
+            if doc_id and per_doc.get(doc_id, 0) >= MAX_CLAIMS_PER_DOC:
+                continue
+            if len(final) >= MAX_SCORED_CLAIMS:
+                break
+            seen.add(key)
+            if doc_id:
+                per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+            final.append(claim)
+
+        abstain = report.get("abstain")
+        abstain = abstain is True or (isinstance(abstain, str) and abstain.strip().lower() == "true")
+        if spliced or not final:
+            abstain = True
+        report["abstain"] = abstain
+        report["claims"] = final
+        report["citations"] = sorted(
+            {c["doc_id"] for c in final if isinstance(c.get("doc_id"), str) and c["doc_id"]}
+        )
+        if not final:
+            answer = report.get("answer")
+            answer = answer.strip() if isinstance(answer, str) else ""
+            report["answer"] = f"{NO_EVIDENCE_NOTE} {answer}".strip()
+        return report

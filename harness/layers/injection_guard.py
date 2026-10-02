@@ -47,12 +47,54 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
 BLOCK_START = "--- LƯU Ý HỆ THỐNG"
 BLOCK_END = "--- HẾT LƯU Ý HỆ THỐNG ---"
 PLACEHOLDER = "[nội dung không đáng tin cậy đã bị loại bỏ]"
+
+
+def _unclosed_end(text: str, start: int) -> int:
+    """Where an unclosed block stops. Inside a JSON search result the block
+    can only run to the end of its own snippet string (the next unescaped
+    quote) — cutting to the end of the whole observation would also throw
+    away every later hit. Anywhere else (a truncated fetch): end of text."""
+    if not text.lstrip().startswith("["):
+        return len(text)
+    index = start
+    while True:
+        index = text.find('"', index)
+        if index == -1:
+            return len(text)
+        backslashes = 0
+        while index - backslashes - 1 >= start and text[index - backslashes - 1] == "\\":
+            backslashes += 1
+        if backslashes % 2 == 0:
+            return index
+        index += 1
+
+
+def sanitise(text: str) -> tuple:
+    """`(clean text, number of blocks removed)`."""
+    removed = 0
+    while BLOCK_START in text:
+        start = text.find(BLOCK_START)
+        close = text.find(BLOCK_END, start)
+        end = close + len(BLOCK_END) if close != -1 else _unclosed_end(text, start)
+        text = text[:start] + PLACEHOLDER + text[end:]
+        removed += 1
+    if INJECTION_CANARY in text:
+        text = text.replace(INJECTION_CANARY, PLACEHOLDER)
+        removed += 1
+    return text, removed
+
+
+def _scrub(value: str) -> str:
+    return value.replace(INJECTION_CANARY, "").strip()
 
 
 class InjectionGuard(Middleware):
@@ -62,17 +104,39 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if result is None or not isinstance(getattr(result, "content", None), str):
+            return result
+        clean, removed = sanitise(result.content)
+        if not removed:
+            return result
+        ctx.state["injection_guard.blocks_removed"] = (
+            ctx.state.get("injection_guard.blocks_removed", 0) + removed
+        )
+        return ToolResult(ok=result.ok, content=clean, error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        if not isinstance(report, dict):
+            return {}
+        answer = report.get("answer")
+        if isinstance(answer, str) and INJECTION_CANARY in answer:
+            report["answer"] = _scrub(answer)
+        # A claim carrying the canary is DELETED, never edited.
+        claims = report.get("claims")
+        if isinstance(claims, list) and INJECTION_CANARY in str(claims):
+            report["claims"] = [c for c in claims if INJECTION_CANARY not in str(c)]
+            report["citations"] = sorted(
+                {
+                    c["doc_id"]
+                    for c in report["claims"]
+                    if isinstance(c, dict) and isinstance(c.get("doc_id"), str) and c["doc_id"]
+                }
+            )
+        # Any other free-text field (e.g. `verdict`): only the canary goes.
+        for key, value in list(report.items()):
+            if key not in ("answer", "claims") and isinstance(value, str) and INJECTION_CANARY in value:
+                report[key] = _scrub(value)
+        if isinstance(report.get("citations"), list):
+            report["citations"] = [
+                c for c in report["citations"] if INJECTION_CANARY not in str(c)
+            ]
+        return report
